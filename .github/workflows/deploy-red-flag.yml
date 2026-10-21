@@ -1,0 +1,101 @@
+# Deploys Red Flag to its own Firebase project: the web app to
+# Hosting, the Cloud Functions, and the Firestore rules.
+#
+# One-time setup (README.md, "Online stellen", has the clicks):
+#   Secrets (Settings → Secrets and variables → Actions → Secrets):
+#     REDFLAG_FIREBASE_SERVICE_ACCOUNT  JSON key of a service account in the
+#                                       Red Flag project (roles: Editor,
+#                                       Firebase Admin, Secret Manager Admin)
+#     REDFLAG_PLACES_API_KEY            Google key with "Places API (New)"
+#     REDFLAG_ANTHROPIC_API_KEY         optional; without it the reviews are
+#                                       checked by keyword matching
+#   Variable (same page → Variables):
+#     REDFLAG_PROJECT_ID                the Firebase project id
+#
+# Manual only: Actions → "Deploy Red Flag" → Run workflow.
+name: Deploy Red Flag
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      PROJECT_ID: ${{ vars.REDFLAG_PROJECT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check setup
+        env:
+          SERVICE_ACCOUNT: ${{ secrets.REDFLAG_FIREBASE_SERVICE_ACCOUNT }}
+          PLACES_API_KEY: ${{ secrets.REDFLAG_PLACES_API_KEY }}
+        run: |
+          missing=0
+          [ -n "$PROJECT_ID" ] || { echo "::error::Variable REDFLAG_PROJECT_ID is not set."; missing=1; }
+          [ -n "$SERVICE_ACCOUNT" ] || { echo "::error::Secret REDFLAG_FIREBASE_SERVICE_ACCOUNT is not set."; missing=1; }
+          [ -n "$PLACES_API_KEY" ] || { echo "::error::Secret REDFLAG_PLACES_API_KEY is not set."; missing=1; }
+          exit $missing
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.47.7
+          channel: stable
+          cache: true
+
+      - name: Sign in to Google Cloud
+        env:
+          SERVICE_ACCOUNT: ${{ secrets.REDFLAG_FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          printf '%s' "$SERVICE_ACCOUNT" > "$RUNNER_TEMP/sa.json"
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/sa.json" >> "$GITHUB_ENV"
+
+      - name: Test the functions
+        working-directory: functions
+        run: |
+          npm ci
+          npm run lint
+          npm test
+
+      - name: Test the app
+        run: |
+          flutter pub get
+          flutter analyze
+          flutter test
+
+      - name: Connect the web app to the project
+        run: node tool/write_firebase_options.mjs "$PROJECT_ID"
+
+      - name: Build the web app
+        run: flutter build web --release
+
+      - name: Store the API keys as function secrets
+        env:
+          PLACES_API_KEY: ${{ secrets.REDFLAG_PLACES_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.REDFLAG_ANTHROPIC_API_KEY }}
+        run: |
+          set_secret() {
+            printf '%s' "$2" > "$RUNNER_TEMP/secret"
+            npx --yes firebase-tools@14 functions:secrets:set "$1" \
+              --data-file "$RUNNER_TEMP/secret" \
+              --project "$PROJECT_ID" --non-interactive
+            rm -f "$RUNNER_TEMP/secret"
+          }
+          set_secret PLACES_API_KEY "$PLACES_API_KEY"
+          set_secret ANTHROPIC_API_KEY "${ANTHROPIC_API_KEY:-none}"
+
+      - name: Deploy
+        run: |
+          npx --yes firebase-tools@14 deploy \
+            --only hosting,functions,firestore:rules \
+            --project "$PROJECT_ID" \
+            --non-interactive --force
+          echo "### Red Flag ist online: https://$PROJECT_ID.web.app" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove the key file
+        if: always()
+        run: rm -f "$RUNNER_TEMP/sa.json"
